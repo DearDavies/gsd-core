@@ -610,3 +610,109 @@ test('#2697: context-monitor skipped for Write when context_warnings disabled (n
     `context-monitor spawn must be skipped for Write when context_warnings:false; spawn argvs: ${JSON.stringify(spawns)}`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// #4916 — OpenCode 2.x dual entrypoint
+// ---------------------------------------------------------------------------
+
+// Faithful emulation of the V2 loader's schema decode: the default export must
+// carry an `id` and an `effect` or `setup` function.
+function v2SchemaDecode(def) {
+  const missing = [];
+  if (typeof def?.id !== 'string') missing.push('id');
+  if (typeof (def?.setup ?? def?.effect) !== 'function') missing.push('effect|setup');
+  return missing;
+}
+
+test('#4916: default export satisfies the OpenCode v2 schema (id + setup)', () => {
+  const mod = require(ADAPTER_SRC);
+  assert.deepEqual(v2SchemaDecode(mod), []);
+  // Non-enumerable: V1's Object.values(mod) must remain exactly [server].
+  assert.ok(!Object.keys(mod).includes('setup'), 'setup must be non-enumerable');
+  assert.equal(loaderExtract(mod).length, 1);
+});
+
+test('#4916: V2 setup(ctx) registers the guards on the V2 domains', async (t) => {
+  const { root, mod } = buildInstalledLayout(t, {
+    'gsd-secret-read-guard.js': stubHook(JSON.stringify({ decision: 'block', reason: 'secret read denied' }), 2),
+    'gsd-context-monitor.js': stubHook(''),
+  });
+  const hooks = {};
+  const events = [];
+  const rec = (domain) => ({ hook: (name, fn) => { hooks[`${domain}.${name}`] = fn; } });
+  const ctx = {
+    directory: root,
+    tool: rec('tool'),
+    shell: rec('shell'),
+    session: rec('session'),
+    event: { subscribe: (fn) => events.push(fn) },
+  };
+  await mod.setup(ctx);
+  for (const k of ['tool.execute.before', 'tool.execute.after', 'shell.create.before', 'session.compaction']) {
+    assert.equal(typeof hooks[k], 'function', `registers ${k}`);
+  }
+  assert.equal(events.length, 1, 'subscribes to the event stream');
+
+  // execute.before blocks through the same guard path as V1.
+  await assert.rejects(
+    () => hooks['tool.execute.before']({ tool: 'read', input: { filePath: '/p/.env' } }),
+    /secret read denied/,
+  );
+
+  // shell.create.before exports GSD_DIR.
+  const shellEvt = {};
+  await hooks['shell.create.before'](shellEvt);
+  assert.equal(shellEvt.env.GSD_DIR, path.join(root, 'gsd-core'));
+
+  // execute.after rewrites managed Read results held in `result`.
+  const managed = path.join(root, 'gsd-core', 'workflows', 'x.md');
+  const afterEvt = { tool: 'read', input: { filePath: managed }, result: 'see ~/.claude/gsd-core/references/foo.md' };
+  await hooks['tool.execute.after'](afterEvt);
+  assert.ok(!afterEvt.result.includes('~/.claude/gsd-core/'));
+
+  // Events: V2 payloads arrive under `data`; events for other locations are ignored.
+  await events[0]({ type: 'session.created', data: { info: { id: 'v2s', directory: root } } });
+  const compactEvt = {};
+  await hooks['session.compaction'](compactEvt);
+  assert.match(compactEvt.result, /\[GSD\] Active session: v2s/);
+  await events[0]({ type: 'session.created', data: { info: { id: 'other', directory: path.join(root, '..', 'elsewhere') } } });
+  const again = {};
+  await hooks['session.compaction'](again);
+  assert.match(again.result, /v2s/, 'foreign-location session events must not replace the active session');
+});
+
+// ---------------------------------------------------------------------------
+// #4849 — hooks must run under a real JS runtime, never the opencode binary
+// ---------------------------------------------------------------------------
+
+test('#4849: isJsRuntime accepts node/bun and rejects the opencode host binary', () => {
+  for (const ok of ['/usr/bin/node', 'C:\\Program Files\\nodejs\\node.exe', '/home/u/.bun/bin/bun', 'nodejs']) {
+    assert.equal(_internals.isJsRuntime(ok), true, ok);
+  }
+  for (const bad of ['/home/u/.opencode/bin/opencode', '/usr/bin/opencode-cli', '', undefined]) {
+    assert.equal(_internals.isJsRuntime(bad), false, String(bad));
+  }
+});
+
+test('#4849: hooks execute (block) when process.execPath is not a JS runtime', async (t) => {
+  const { mod } = buildInstalledLayout(t, {
+    'gsd-secret-read-guard.js': stubHook(JSON.stringify({ decision: 'block', reason: 'secret read denied' }), 2),
+  });
+  // Simulate the Bun single-file host: execPath is a non-JS binary that, like
+  // opencode, exits 0 with no output when handed a script path.
+  const realExecPath = process.execPath;
+  const fake = path.join(os.tmpdir(), `opencode-fake-${process.pid}`);
+  fs.writeFileSync(fake, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  t.after(() => {
+    Object.defineProperty(process, 'execPath', { value: realExecPath, configurable: true, writable: true });
+    cleanup(fake);
+  });
+  Object.defineProperty(process, 'execPath', { value: fake, configurable: true, writable: true });
+  delete require.cache[require.resolve(path.join(path.dirname(__dirname), '.opencode/plugins/gsd-core.js'))];
+  const handlers = await mod.server({ directory: process.cwd() });
+  await assert.rejects(
+    () => handlers['tool.execute.before']({ tool: 'read' }, { args: { filePath: '/p/.env' } }),
+    /secret read denied/,
+    'guard must actually run (and block) even though execPath is the host binary',
+  );
+});

@@ -239,6 +239,52 @@ function gitProbingGuardTimeoutMs() {
   return GIT_PROBING_GUARD_FALLBACK_TIMEOUT_MS;
 }
 
+// #4849: the hook scripts are plain Node scripts, so they must be run by a JS
+// runtime. `process.execPath` is only that when the host IS node/bun; on
+// OpenCode's Bun single-file binary it is the `opencode` executable, which
+// treats the script path as a project directory, prints nothing and exits 0 —
+// every guard would read as a silent allow (and each spawn leaks its unpacked
+// native library into /tmp). Resolve a real runtime instead.
+const JS_RUNTIME_BASENAME = /^(node|nodejs|bun)(\.exe)?$/i;
+
+function isJsRuntime(execPath) {
+  // Split on both separators: a Windows path must classify the same on any host.
+  return JS_RUNTIME_BASENAME.test(String(execPath || "").split(/[\\/]/).pop());
+}
+
+let _hookRuntime;
+let warnedNoHookRuntime = false;
+
+/**
+ * Pick the executable used to run hook scripts. Order: `GSD_HOOK_RUNTIME` env
+ * override → `process.execPath` when it is node/bun → `node` on PATH → `bun`
+ * on PATH. Probed once and cached. Returns null when nothing usable exists.
+ */
+function resolveHookRuntime() {
+  if (_hookRuntime !== undefined) return _hookRuntime;
+  const candidates = [];
+  if (process.env.GSD_HOOK_RUNTIME) candidates.push(process.env.GSD_HOOK_RUNTIME);
+  if (isJsRuntime(process.execPath)) candidates.push(process.execPath);
+  candidates.push("node", "bun");
+  _hookRuntime = null;
+  for (const candidate of candidates) {
+    try {
+      const probe = spawnSync(candidate, ["--version"], {
+        encoding: "utf8",
+        timeout: 5000,
+        windowsHide: true,
+      });
+      if (!probe.error && probe.status === 0) {
+        _hookRuntime = candidate;
+        break;
+      }
+    } catch {
+      // try the next candidate
+    }
+  }
+  return _hookRuntime;
+}
+
 function runHook(hookFile, payload, opts = {}) {
   const hookPath = path.join(HOOKS_DIR, hookFile);
   if (!fs.existsSync(hookPath)) {
@@ -259,9 +305,23 @@ function runHook(hookFile, payload, opts = {}) {
   const timeout =
     opts.timeout ??
     (GIT_PROBING_GUARDS.has(hookFile) ? gitProbingGuardTimeoutMs() : 8000);
+  const runtime = resolveHookRuntime();
+  if (!runtime) {
+    // No JS runtime to run the guards: never break the tool call, but a guard
+    // that did not run must not look like an allow — warn loudly, once.
+    if (!warnedNoHookRuntime) {
+      warnedNoHookRuntime = true;
+      console.error(
+        "[gsd-core] no JS runtime (node/bun) found to run GSD hooks — guards " +
+          "are NOT enforced. Install Node.js or set GSD_HOOK_RUNTIME to a " +
+          "node/bun executable.",
+      );
+    }
+    return { stdout: "", exitCode: 0, timedOut: false };
+  }
   let result;
   try {
-    result = spawnSync(process.execPath, [hookPath], {
+    result = spawnSync(runtime, [hookPath], {
       input: JSON.stringify(payload),
       encoding: "utf8",
       timeout,
@@ -531,15 +591,16 @@ function prepareSkillsCache() {
 // Plugin entry
 // ===========================================================================
 
-const GsdCorePlugin = async ({ directory } = {}) => {
-  if (directory) currentCwd = directory;
+// ── Shared handlers ──────────────────────────────────────────────────────
+// The V1 hook map (`server`) and the V2 `setup(ctx)` entrypoint are thin
+// adapters over the functions below, so both loaders get identical guard
+// behavior (#4916).
 
-  return {
-    // ── Config: register commands / agents / skills paths ──────────────
-    // Only in package-tree mode (Option 2). In an installed config dir
-    // (Option 1) GSD's native file copy already registered these, so the
-    // plugin stays out of registration to avoid double-registering.
-    config: async (config) => {
+// Register commands / agents / skills paths. Only in package-tree mode
+// (Option 2). In an installed config dir (Option 1) GSD's native file copy
+// already registered these, so the plugin stays out of registration to avoid
+// double-registering.
+function registerPackageTree(config) {
       if (!IS_PACKAGE_TREE) return;
 
       // Commands (commands/gsd/*.md → gsd-<name>)
@@ -582,18 +643,13 @@ const GsdCorePlugin = async ({ directory } = {}) => {
       if (!config.skills.paths.includes(skillsPath)) {
         config.skills.paths.push(skillsPath);
       }
-    },
+}
 
-    // ── shell.env ───────────────────────────────────────────────────────
-    "shell.env": async (_input, output) => {
-      output.env = output.env || {};
-      output.env.GSD_DIR = GSD_CORE;
-    },
-
-    // ── tool.execute.before — PreToolUse hooks ─────────────────────────
-    "tool.execute.before": async (input, output) => {
-      const claudeTool = mapToolName(input.tool);
-      const toolInput = mapToolInput(output.args || {});
+// PreToolUse hooks. `args` is OpenCode's mutable tool-argument object; `output`
+// is where advisories land (`output.metadata`).
+function toolBefore(tool, args, output) {
+      const claudeTool = mapToolName(tool);
+      const toolInput = mapToolInput(args || {});
       const cwd = currentCwd;
 
       // 0. Read path rewrite — redirect ~/.claude/gsd-core/ to actual GSD_CORE
@@ -605,7 +661,7 @@ const GsdCorePlugin = async ({ directory } = {}) => {
           .replace(/^~\/\.claude\/gsd-core\//, GSD_CORE + "/")
           .replace(/(?:.*)\/\.claude\/gsd-core\//, GSD_CORE + "/");
         if (rewritten !== original) {
-          const args = output.args || {};
+          args = args || {};
           if (args.filePath) args.filePath = rewritten;
           else if (args.path) args.path = rewritten;
           else if (args.file_path) args.file_path = rewritten;
@@ -667,28 +723,25 @@ const GsdCorePlugin = async ({ directory } = {}) => {
         const r = runHook("gsd-secret-read-guard.js", prePayload());
         handleHookResult(r, output);
       }
-    },
+}
 
-    // ── tool.execute.after — PostToolUse hooks ─────────────────────────
-    "tool.execute.after": async (input, output) => {
-      const claudeTool = mapToolName(input.tool);
-      // NOTE: In the `after` hook, `args` lives on `input` (not `output`).
-      // The `output` object only has { title, output, metadata }.
-      const toolInput = mapToolInput(input.args || {});
+// PostToolUse hooks. `getText`/`setText` abstract where the tool result lives
+// (V1: `output.output`; V2: `event.result`).
+function toolAfter(tool, args, getText, setText, output) {
+      const claudeTool = mapToolName(tool);
+      const toolInput = mapToolInput(args || {});
       const cwd = currentCwd;
+      const text = getText();
 
       // GSD content transform — rewrite paths + namespace in Read results
       // BEFORE injection scanning so the scanner sees the final content.
       if (
         claudeTool === "Read" &&
-        output.output &&
+        text &&
         isGsdManagedFile(toolInput.file_path)
       ) {
-        const content =
-          typeof output.output === "string"
-            ? output.output
-            : String(output.output);
-        output.output = rewriteContent(content);
+        const content = typeof text === "string" ? text : String(text);
+        setText(rewriteContent(content));
       }
 
       // gsd-read-injection-scanner.js — scan Read/WebFetch/WebSearch results
@@ -701,7 +754,7 @@ const GsdCorePlugin = async ({ directory } = {}) => {
           hook_event_name: "PostToolUse",
           tool_name: claudeTool,
           tool_input: toolInput,
-          tool_response: output.output,
+          tool_response: getText(),
           cwd,
         };
         const r = runHook("gsd-read-injection-scanner.js", payload);
@@ -726,10 +779,10 @@ const GsdCorePlugin = async ({ directory } = {}) => {
         const r = runHook("gsd-context-monitor.js", payload);
         handleHookResult(r, output);
       }
-    },
+}
 
-    // ── experimental.session.compacting — PreCompact ───────────────────
-    "experimental.session.compacting": async (_input, output) => {
+// PreCompact. `output.context` receives the GSD breadcrumb.
+function compacting(output) {
       if (!currentSessionId) return;
       const payload = {
         hook_event_name: "PreCompact",
@@ -744,10 +797,11 @@ const GsdCorePlugin = async ({ directory } = {}) => {
       output.context.push(
         `[GSD] Active session: ${currentSessionId}. Preserve any in-flight phase/plan state.`,
       );
-    },
+}
 
-    // ── General event subscriptions ─────────────────────────────────────
-    event: async ({ event }) => {
+// General event subscriptions. `event.properties` carries the payload (the V2
+// adapter maps V2's `data` onto it).
+function handleEvent(event) {
       // session.created → SessionStart hooks
       if (event.type === "session.created") {
         // Track session for context-monitor payloads.
@@ -825,9 +879,124 @@ const GsdCorePlugin = async ({ directory } = {}) => {
       if (event.type === "session.error") {
         return;
       }
+}
+
+// ── V1 entrypoint: hook map ─────────────────────────────────────────────
+const GsdCorePlugin = async ({ directory } = {}) => {
+  if (directory) currentCwd = directory;
+
+  return {
+    config: async (config) => registerPackageTree(config),
+
+    "shell.env": async (_input, output) => {
+      output.env = output.env || {};
+      output.env.GSD_DIR = GSD_CORE;
     },
+
+    "tool.execute.before": async (input, output) =>
+      toolBefore(input.tool, output.args, output),
+
+    // NOTE: In the `after` hook, `args` lives on `input` (not `output`).
+    // The `output` object only has { title, output, metadata }.
+    "tool.execute.after": async (input, output) =>
+      toolAfter(
+        input.tool,
+        input.args,
+        () => output.output,
+        (v) => {
+          output.output = v;
+        },
+        output,
+      ),
+
+    "experimental.session.compacting": async (_input, output) =>
+      compacting(output),
+
+    event: async ({ event }) => handleEvent(event),
   };
 };
+
+// ── V2 entrypoint: setup(ctx) ───────────────────────────────────────────
+// OpenCode 2.x ignores `server()` and requires the default export to carry
+// `{ id, setup | effect }` (#4916). The hook domains below follow the V2
+// plugin contract (opencode.ai/v2/docs/build/plugins/migrate-v1): event
+// payloads arrive under `data` (not V1 `properties`) and the event stream is
+// server-global, so events are filtered to this plugin's project directory.
+function resultAccessors(event) {
+  const r = event.result;
+  if (r && typeof r === "object" && "output" in r) {
+    return [() => r.output, (v) => { r.output = v; }];
+  }
+  return [() => event.result, (v) => { event.result = v; }];
+}
+
+function eventInProject(data) {
+  const dir =
+    data?.info?.directory || data?.directory || data?.location?.directory;
+  if (!dir) return true; // no location on the payload — cannot filter
+  return path.resolve(dir) === path.resolve(currentCwd);
+}
+
+async function GsdCorePluginSetup(ctx) {
+  if (ctx?.directory) currentCwd = ctx.directory;
+
+  if (ctx.tool?.hook) {
+    ctx.tool.hook("execute.before", async (event) => {
+      toolBefore(event.tool, event.input, event);
+    });
+    ctx.tool.hook("execute.after", async (event) => {
+      const [get, set] = resultAccessors(event);
+      toolAfter(event.tool, event.input, get, set, event);
+    });
+  }
+
+  if (ctx.shell?.hook) {
+    ctx.shell.hook("create.before", async (event) => {
+      event.env = event.env || {};
+      event.env.GSD_DIR = GSD_CORE;
+    });
+  }
+
+  if (ctx.session?.hook) {
+    ctx.session.hook("compaction", async (event) => {
+      const out = { context: [] };
+      compacting(out);
+      if (out.context.length) {
+        const note = out.context.join("\n");
+        event.result =
+          typeof event.result === "string" && event.result
+            ? `${event.result}\n${note}`
+            : note;
+      }
+    });
+  }
+
+  if (ctx.event?.subscribe) {
+    ctx.event.subscribe(async (event) => {
+      const data = event.data || {};
+      if (!eventInProject(data)) return;
+      handleEvent({ ...event, properties: data });
+    });
+  }
+
+  if (IS_PACKAGE_TREE) {
+    const staged = {};
+    registerPackageTree(staged);
+    for (const [name, def] of Object.entries(staged.command || {})) {
+      ctx.command?.transform?.((cmds) => ({ ...cmds, [name]: cmds?.[name] || def }));
+    }
+    for (const [name, def] of Object.entries(staged.agent || {})) {
+      ctx.agent?.transform?.((agents) => ({ ...agents, [name]: agents?.[name] || def }));
+    }
+    const skillPaths = staged.skills?.paths || [];
+    if (skillPaths.length) {
+      ctx.skill?.transform?.((cfg) => ({
+        ...cfg,
+        paths: [...new Set([...(cfg?.paths || []), ...skillPaths])],
+      }));
+    }
+  }
+}
 
 // Export shape — verified against OpenCode's plugin loader source
 // (packages/opencode/src/plugin). The loader imports this module and runs
@@ -861,12 +1030,24 @@ GsdCorePlugin._internals = {
   rewriteContent,
   isGsdManagedFile,
   handleHookResult,
+  resolveHookRuntime,
+  isJsRuntime,
   GsdCorePlugin,
+  GsdCorePluginSetup,
 };
 
 const gsdCorePluginExport = { server: GsdCorePlugin };
 Object.defineProperty(gsdCorePluginExport, "id", {
   value: "gsd-core",
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+// V2 entrypoint — non-enumerable for the same reason as `id`: V1's
+// `Object.values(mod)` iteration must stay exactly `[server]`; an enumerable
+// `setup` would be invoked as a second V1 plugin.
+Object.defineProperty(gsdCorePluginExport, "setup", {
+  value: GsdCorePluginSetup,
   enumerable: false,
   writable: false,
   configurable: false,
