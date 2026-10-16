@@ -195,6 +195,14 @@ describe('#5122 self-load is runnable and names the agent type', () => {
 
       test('the launcher is defined in or before the self-load block', () => {
         const selfIdx = blocks.findIndex((b) => b.includes(selfLoad));
+        const resolverAt = content.indexOf('references/gsd-run-resolver.md');
+        if (resolverAt !== -1) {
+          // These agents define gsd_run through the shared resolver reference
+          // (scripts/sync-runtime-launcher.cjs never inlines a second copy), so
+          // the self-load has to sit after that include.
+          assert.ok(resolverAt < content.indexOf(selfLoad), 'self-load must follow the gsd-run-resolver include');
+          return;
+        }
         const firstGsdRun = blocks.findIndex((b) => b.includes('gsd_run'));
         assert.ok(firstGsdRun !== -1 && firstGsdRun <= selfIdx, 'self-load must not precede the first gsd_run block');
         assert.ok(

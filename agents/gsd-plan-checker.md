@@ -728,6 +728,12 @@ issue:
 Load phase operation context:
 @~/.claude/gsd-core/references/gsd-run-resolver.md
 
+After `gsd_run` is defined, run the `agent_skills` self-load from the init step above (skip it if your prompt already contains an `<agent_skills>` block). Your agent type is `gsd-plan-checker`:
+
+```bash
+_AGENT_SKILLS=$(gsd_run query agent-skills gsd-plan-checker --skills-only)
+```
+
 ```bash
 INIT=$(gsd_run query init.phase-op "${PHASE_ARG}")
 if [[ "$INIT" == @file:* ]]; then INIT=$(cat "${INIT#@file:}"); fi

@@ -22,21 +22,37 @@ In your mandatory init step — right after `mandatory-initial-read.md` / the
    injection also runs (e.g. Claude Code). The guard is what keeps the two seams from
    doubling the block.
 
-2. **Query your configured skills.** Use **your own agent type** — the `name:` value in
-   your frontmatter (e.g. an agent whose frontmatter says `name: gsd-executor` queries
-   `gsd-executor`). The query is read-only and idempotent — it exits 0 with an empty
-   block when nothing is configured for your type:
+2. **Query your configured skills.** Run the self-load block that sits next to the
+   pointer in your own agent file. It states your **agent type** in the body and
+   queries it with `--skills-only`, for example:
 
    ```bash
-   _AGENT_SKILLS=$(gsd_run query agent-skills <YOUR-FRONTMATTER-NAME> 2>/dev/null || true)
+   _AGENT_SKILLS=$(gsd_run query agent-skills gsd-executor --skills-only)
    ```
 
-   The runtime `gsd_run` resolver is the standard one from
-   `_runtime-launcher.snippet.sh`; your own init already defines it.
+   The type is written into the body because frontmatter `name:` is not visible to
+   an agent on every runtime (Claude Code shows a subagent only the body, the Kimi
+   converter drops it, Codex keeps it in a TOML key). The block is also what defines
+   `gsd_run`: it carries the canonical launcher preamble, or follows the shared
+   `gsd-run-resolver.md` include in agents that use it. The query is read-only and
+   idempotent, its stderr stays visible, and a failure is not turned into an empty
+   result, so a missing launcher is never mistaken for "nothing configured".
 
 3. **Read every listed skill.** The block emits entries as `@<path>/SKILL.md`
    includes — `Read` each one before starting work. If the block is empty, there is
    nothing to do (zero overhead).
+
+## What the query returns, per runtime
+
+| Call | Claude | Non-Claude (Codex, Kimi, OpenCode, Kilo, …) |
+|---|---|---|
+| `query agent-skills <type> --skills-only` (the self-load) | configured skills, or an empty block | configured skills, or an empty block |
+| `query agent-skills <type>` (orchestrator-side `${AGENT_SKILLS_*}` injection) | configured skills, or an empty block | configured skills, or — when nothing is configured and the agent is installed — the agent's own **persona** (#2454, #4407) |
+
+On a non-Claude runtime the plain query can answer with the agent's whole persona
+(about 47 KB for the executor). `--skills-only` is what keeps the self-load from
+reading your own persona back into your context as if it were a skills block. Never run the query without it from inside
+an agent.
 
 ## What self-load does and does not cover
 

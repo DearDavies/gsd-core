@@ -86,6 +86,12 @@ At verification decision points, reference calibration examples:
 
 @~/.claude/gsd-core/references/gsd-run-resolver.md
 
+After `gsd_run` is defined, run the `agent_skills` self-load from the init step above (skip it if your prompt already contains an `<agent_skills>` block). Your agent type is `gsd-verifier`:
+
+```bash
+_AGENT_SKILLS=$(gsd_run query agent-skills gsd-verifier --skills-only)
+```
+
 ## Step 0: Check for Previous Verification
 
 ```bash
