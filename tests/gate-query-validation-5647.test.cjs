@@ -64,6 +64,19 @@ function registryQueries() {
   return [...queries].sort();
 }
 
+const UNKNOWN_COMMAND = 'sdk_unknown_command';
+
+/** The typed `reason` of a `--json-errors` failure (the CLI prints it to stderr or stdout), else undefined. */
+function failureReason(result) {
+  for (const stream of [result.stderr, result.stdout]) {
+    try {
+      const parsed = JSON.parse(String(stream).trim());
+      if (parsed !== null && typeof parsed === 'object' && typeof parsed.reason === 'string') return parsed.reason;
+    } catch { /* not a JSON error on this stream */ }
+  }
+  return undefined;
+}
+
 const tmpDirs = [];
 after(() => { for (const d of tmpDirs) { try { cleanup(d); } catch { /* best-effort */ } } });
 
@@ -86,9 +99,13 @@ describe('gate query validation accepts the registry and rejects the injection s
     tmpDirs.push(cwd);
     const normalize = documentedNormalization();
     for (const query of registryQueries()) {
-      const r = runTools(['check', normalize(query)], cwd);
-      const combined = `${r.stdout}\n${r.stderr}`;
-      assert.ok(!combined.includes('Unknown check subcommand'), `${query} -> ${normalize(query)} is not a known check`);
+      const r = runTools(['check', normalize(query), '--json-errors'], cwd);
+      if (r.exitCode === 0) continue; // a gate that ran and answered
+      // A failure of a KNOWN check is a typed usage failure (a missing phase argument, for one); only an
+      // id the router does not know carries the unknown-command reason.
+      const reason = failureReason(r);
+      assert.equal(typeof reason, 'string', `${query}: a failing run must report a typed reason, got ${r.stdout}${r.stderr}`);
+      assert.notEqual(reason, UNKNOWN_COMMAND, `${query} -> ${normalize(query)} is not a known check`);
     }
     t.diagnostic(`${registryQueries().length} queries routed`);
   });
@@ -98,9 +115,9 @@ describe('gate query validation accepts the registry and rejects the injection s
     tmpDirs.push(cwd);
     const query = 'nope.gate';
     assert.ok(documentedAllowlist().test(documentedNormalization()(query)), 'the allowlist alone cannot know the check');
-    const r = runTools(['check', documentedNormalization()(query)], cwd);
+    const r = runTools(['check', documentedNormalization()(query), '--json-errors'], cwd);
     assert.notEqual(r.exitCode, 0, 'an id naming no known check must not succeed');
-    assert.ok(`${r.stdout}\n${r.stderr}`.includes('Unknown check subcommand'), 'the router names it unknown');
+    assert.equal(failureReason(r), UNKNOWN_COMMAND, 'the router reports it as an unknown command');
   });
 
   test('a space-separated multi-word query is still accepted (#5647)', () => {

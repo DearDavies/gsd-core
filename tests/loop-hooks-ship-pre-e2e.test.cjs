@@ -757,6 +757,13 @@ describe('capability gate dispatch — manifest input is validated before shell 
         `${name} states the validation mandate only AFTER the interpolation it is supposed to ` +
         'guard; an executing agent reads top-down and would run the command first.',
       );
+      // #5647: the registry's query ids are dotted; the value validated must be the value passed.
+      assert.match(
+        body,
+        /write the dot-normalized query/,
+        `${name} must tell an executing agent to write the dot-normalized query where it shows ` +
+        '${hook.check.query}, or the value it validates is not the value it passes.',
+      );
     });
   }
 
