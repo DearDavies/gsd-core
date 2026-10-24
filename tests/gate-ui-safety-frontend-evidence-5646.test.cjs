@@ -159,8 +159,10 @@ describe('ui-safety-gate requires static frontend evidence, as ui-plan-gate does
       const plan = computeUiPlanGate(dir, '1');
       const safety = computeUiSafetyGate(dir, '1');
       const label = JSON.stringify(Object.keys({ ...spec.rootFiles, ...spec.phaseFiles }));
+      assert.equal(safety.hasUiFiles, true, `every case changes a UI-pattern file: ${label}`);
       assert.equal(safety.hasFrontendEvidence, plan.hasFrontendEvidence, `evidence differs for ${label}`);
-      assert.equal(safety.block, plan.hasFrontendEvidence ? safety.hasUiFiles && !safety.hasUiSpec : false, `block differs for ${label}`);
+      // With UI files changed and no UI-SPEC, the post-wave verdict is the plan-time verdict.
+      assert.equal(safety.block, plan.block, `block differs for ${label}`);
     }
   });
 });
