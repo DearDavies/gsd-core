@@ -682,7 +682,8 @@ const WORKFLOWS_DIR = path.join(__dirname, '..', 'gsd-core', 'workflows');
 const SHELL_INTERPOLATED_QUERY = /gsd_run check \$\{hook\.check\.query\}/;
 // The charset a query must be validated against before it may be run. Stated ONCE, in the
 // reference — restating it at five sites would be the drift this PR just repaired.
-const VALIDATION_CHARSET = /\^\[a-z\]\[a-z0-9-\]\*\( \[a-z\]\[a-z0-9-\]\*\)\*\$/;
+// #5647: applied to the dot-normalized value (tests/gate-query-validation-5647.test.cjs pins the behavior).
+const VALIDATION_CHARSET = /\^\[a-z\]\[a-z0-9\]\*\(-\[a-z0-9\]\+\)\*\( \[a-z\]\[a-z0-9\]\*\(-\[a-z0-9\]\+\)\*\)\*\$/;
 // The per-site mandate: every dispatch site must tell an executing agent to validate BEFORE
 // it reaches a shell, and where the rule lives.
 const VALIDATE_MANDATE = /Validate `check` before shell use/;

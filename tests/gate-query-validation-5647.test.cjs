@@ -24,7 +24,6 @@ const realRegistry = require('../gsd-core/bin/lib/capability-registry.cjs');
 
 const REFERENCE = path.join(__dirname, '..', 'gsd-core', 'references', 'loop-hook-dispatch.md');
 
-// allow-test-rule: source-text-is-the-product (#5647)
 // loop-hook-dispatch.md is shipped content an orchestrator executes: the rule only exists as this text.
 const reference = fs.readFileSync(REFERENCE, 'utf8');
 const gateSection = reference.slice(reference.indexOf('### `gate`'));
